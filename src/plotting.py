@@ -40,10 +40,59 @@ def _pivot_surface(
     return pivot[[c for c in expiry_order if c in pivot.columns]]
 
 
+def _interpolated_grid(
+    df: pd.DataFrame,
+    spot: float,
+    moneyness_band: tuple[float, float] = (0.85, 1.15),
+    n_points: int = 41,
+) -> pd.DataFrame:
+    """Resample each expiry's vol smile onto a shared moneyness grid.
+
+    Different expiries are quoted at different strike increments (near-dated
+    weeklies trade every $1, far-dated monthlies every $5-25), so a raw
+    strike x expiry pivot is mostly empty cells between expiries that don't
+    share a strike. This interpolates linearly, per expiry, over moneyness
+    (K/spot) - a 1D interpolation of already-computed implied vols between
+    real quoted strikes, not a fabricated quote. Expiries with fewer than 3
+    priced strikes in the band are dropped (not enough points to interpolate
+    a smile from, shown as a gap instead of guessed).
+    """
+    ok = df[df["error"].isna()].copy()
+    if ok.empty:
+        raise ValueError("No successfully priced rows to plot - every strike failed inversion")
+    ok["moneyness"] = ok["strike"] / spot
+    ok = ok[(ok["moneyness"] >= moneyness_band[0]) & (ok["moneyness"] <= moneyness_band[1])]
+    if ok.empty:
+        raise ValueError(f"No strikes left within moneyness band {moneyness_band} of spot={spot}")
+
+    grid_m = np.linspace(moneyness_band[0], moneyness_band[1], n_points)
+    expiry_order = ok.drop_duplicates("expiry").sort_values("T")["expiry"].tolist()
+
+    cols = {}
+    for expiry in expiry_order:
+        slice_df = ok[ok["expiry"] == expiry].sort_values("moneyness")
+        if len(slice_df) < 3:
+            continue
+        cols[expiry] = np.interp(
+            grid_m, slice_df["moneyness"], slice_df["implied_vol"], left=np.nan, right=np.nan
+        )
+    if not cols:
+        raise ValueError("No expiry had >= 3 priced strikes in the moneyness band - can't interpolate a smile")
+
+    strikes = grid_m * spot
+    return pd.DataFrame(cols, index=strikes)
+
+
 def plot_heatmap(
-    df: pd.DataFrame, ticker: str, spot: float | None = None, ax: plt.Axes | None = None
+    df: pd.DataFrame, ticker: str, spot: float, ax: plt.Axes | None = None
 ) -> plt.Axes:
-    pivot = _pivot_surface(df, spot=spot)
+    """Heatmap on the moneyness-interpolated grid (see `_interpolated_grid`),
+    not the raw strike pivot - the raw pivot is mostly empty cells between
+    expiries that don't share a strike increment, which was unusable for a
+    published figure. `spot` is required (not optional) because the
+    interpolation needs it to convert strike<->moneyness.
+    """
+    pivot = _interpolated_grid(df, spot=spot)
     if ax is None:
         _, ax = plt.subplots(figsize=(10, 7))
     im = ax.imshow(pivot.values, aspect="auto", cmap="viridis", origin="lower")
@@ -51,33 +100,28 @@ def plot_heatmap(
     ax.set_xticklabels(pivot.columns, rotation=45, ha="right")
     # thin y-tick labels so they stay legible regardless of strike count
     n_strikes = len(pivot.index)
-    step = max(1, n_strikes // 25)
+    step = max(1, n_strikes // 20)
     ytick_pos = list(range(0, n_strikes, step))
     ax.set_yticks(ytick_pos)
     ax.set_yticklabels([f"{pivot.index[i]:.0f}" for i in ytick_pos])
     ax.set_xlabel("Expiry")
-    ax.set_ylabel("Strike")
+    ax.set_ylabel("Strike (moneyness-interpolated)")
     ax.set_title(f"{ticker} implied volatility surface (heatmap)")
     plt.colorbar(im, ax=ax, label="Implied vol")
     return ax
 
 
-def plot_surface_3d(df: pd.DataFrame, ticker: str, spot: float | None = None) -> plt.Figure:
-    """3D surface plot.
-
-    Unlike the heatmap, plot_surface needs a complete rectangular grid - it
-    interpolates across NaN gaps and produces spurious spikes where strikes
-    are missing for some expiries (different expiries quote different strike
-    increments, e.g. weeklies vs monthlies). So this view is restricted to
-    the strikes quoted at every expiry in the window (set intersection) -
-    fewer points than the heatmap shows, but no fabricated interpolation.
+def plot_surface_3d(df: pd.DataFrame, ticker: str, spot: float) -> plt.Figure:
+    """3D surface plot, on the same moneyness-interpolated grid as the
+    heatmap (see `_interpolated_grid`) - `plot_surface` needs a complete
+    rectangular grid, and interpolating per-expiry smiles onto a shared
+    moneyness axis gives one without the spurious spikes a raw NaN-pivot
+    produces (see README "what failed on the way here").
     """
-    pivot = _pivot_surface(df, spot=spot)
-    pivot = pivot.dropna(axis=0, how="any")
+    pivot = _interpolated_grid(df, spot=spot).dropna(axis=0, how="any")
     if pivot.empty:
         raise ValueError(
-            "No strike is quoted across every selected expiry - can't build a complete 3D grid. "
-            "Use plot_heatmap instead, which tolerates partial coverage."
+            "No strike survives in every expiry's interpolated range - can't build a complete 3D grid."
         )
     T_by_expiry = df.drop_duplicates("expiry").set_index("expiry")["T"]
     x_t = np.array([T_by_expiry[c] for c in pivot.columns])

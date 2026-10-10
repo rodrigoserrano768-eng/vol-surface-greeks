@@ -25,10 +25,25 @@ def main() -> int:
     parser.add_argument("ticker")
     parser.add_argument("--n-expiries", type=int, default=6)
     parser.add_argument("--out-prefix", default="surface")
+    parser.add_argument(
+        "--spread",
+        action="store_true",
+        help=(
+            "Pick n-expiries evenly spaced across all listed expiries instead of "
+            "the n nearest-dated ones. The nearest weeklies barely share strike "
+            "increments with each other, which fragments the surface plots; "
+            "spreading across monthlies gives a cleaner term structure."
+        ),
+    )
     args = parser.parse_args()
 
     spot = fetch_spot(args.ticker)
-    expiries = list_expiries(args.ticker)[: args.n_expiries]
+    all_expiries = list_expiries(args.ticker)
+    if args.spread and len(all_expiries) > args.n_expiries:
+        idx = [round(i * (len(all_expiries) - 1) / (args.n_expiries - 1)) for i in range(args.n_expiries)]
+        expiries = [all_expiries[i] for i in sorted(set(idx))]
+    else:
+        expiries = all_expiries[: args.n_expiries]
     print(f"{args.ticker} spot={spot:.2f}, using {len(expiries)} expiries: {expiries}")
 
     chains = {}
