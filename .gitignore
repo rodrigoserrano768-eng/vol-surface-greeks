@@ -7,3 +7,4 @@ data_cache/*.parquet
 venv/
 *.egg-info/
 .DS_Store
+DEFENSA.md
